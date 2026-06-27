@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import ipaddress
 import json
 import os
@@ -57,6 +58,27 @@ def yellow(s): return C.w("33", s)
 def cyan(s):   return C.w("36", s)
 def bold(s):   return C.w("1", s)
 def dim(s):    return C.w("2", s)
+
+
+# --------------------------------------------------------------------------- #
+# ASCII art
+# --------------------------------------------------------------------------- #
+LOGO = '           _                         _       __ \n    ____  (_)___  ____ _____  ____  (_)___  / /_\n   / __ \\/ / __ \\/ __ `/ __ \\/ __ \\/ / __ \\/ __/\n  / /_/ / / / / / /_/ / /_/ / /_/ / / / / / /_  \n / .___/_/_/ /_/\\__, / .___/\\____/_/_/ /_/\\__/  \n/_/            /____/_/                         '
+
+ART_HEALTHY = '██╗  ██╗███████╗ █████╗ ██╗  ████████╗██╗  ██╗██╗   ██╗\n██║  ██║██╔════╝██╔══██╗██║  ╚══██╔══╝██║  ██║╚██╗ ██╔╝\n███████║█████╗  ███████║██║     ██║   ███████║ ╚████╔╝ \n██╔══██║██╔══╝  ██╔══██║██║     ██║   ██╔══██║  ╚██╔╝  \n██║  ██║███████╗██║  ██║███████╗██║   ██║  ██║   ██║   \n╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝╚═╝   ╚═╝  ╚═╝   ╚═╝   \n                                                       '
+
+ART_PROBLEM = '██████╗ ██████╗  ██████╗ ██████╗ ██╗     ███████╗███╗   ███╗\n██╔══██╗██╔══██╗██╔═══██╗██╔══██╗██║     ██╔════╝████╗ ████║\n██████╔╝██████╔╝██║   ██║██████╔╝██║     █████╗  ██╔████╔██║\n██╔═══╝ ██╔══██╗██║   ██║██╔══██╗██║     ██╔══╝  ██║╚██╔╝██║\n██║     ██║  ██║╚██████╔╝██████╔╝███████╗███████╗██║ ╚═╝ ██║\n╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚══════╝╚═╝     ╚═╝\n                                                            '
+
+
+def banner():
+    """Logo shown immediately on launch, so you know it's working."""
+    art = green(LOGO) if C.enabled else LOGO
+    return art + "\n" + dim("                         made by utilman") + "\n"
+
+
+def status_art(healthy):
+    art = ART_HEALTHY if healthy else ART_PROBLEM
+    return (green(art) if healthy else red(art)) if C.enabled else art
 
 
 PASS, FAIL, WARN, INFO = "PASS", "FAIL", "WARN", "INFO"
@@ -480,7 +502,123 @@ def gather_info(want_public=True):
     }
 
 
-def diagnose(info, target=None):
+def _iface_bytes():
+    """Cumulative (rx_bytes, tx_bytes) across active interfaces, or None."""
+    try:
+        if OS == "Linux":
+            rx = tx = 0
+            with open("/proc/net/dev") as f:
+                for line in f.readlines()[2:]:
+                    name, _, data = line.partition(":")
+                    if name.strip() == "lo":
+                        continue
+                    cols = data.split()
+                    if len(cols) >= 16:
+                        rx += int(cols[0]); tx += int(cols[8])
+            return rx, tx
+        elif OS == "Darwin":
+            _, out, _ = run(["netstat", "-ibn"])
+            seen, rx, tx = set(), 0, 0
+            for line in out.splitlines()[1:]:
+                c = line.split()
+                if len(c) >= 10 and c[0] != "lo0" and c[0] not in seen:
+                    try:
+                        rx += int(c[6]); tx += int(c[9]); seen.add(c[0])
+                    except ValueError:
+                        continue
+            return rx, tx
+        elif OS == "Windows":
+            _, out, _ = run(["netstat", "-e"])
+            nums = re.findall(r"Bytes\s+(\d+)\s+(\d+)", out)
+            if nums:
+                return int(nums[0][0]), int(nums[0][1])
+    except Exception:
+        pass
+    return None
+
+
+def throughput(interval=1.0):
+    """Sample byte counters over `interval` seconds → (down_Bps, up_Bps)."""
+    a = _iface_bytes()
+    if a is None:
+        return None
+    time.sleep(interval)
+    b = _iface_bytes()
+    if b is None:
+        return None
+    return max(0, (b[0] - a[0]) / interval), max(0, (b[1] - a[1]) / interval)
+
+
+def rate(bps):
+    """Bytes/sec → human string."""
+    if bps is None:
+        return "?"
+    for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
+        if bps < 1024:
+            return f"{bps:.0f} {unit}" if unit == "B/s" else f"{bps:.1f} {unit}"
+        bps /= 1024
+    return f"{bps:.1f} TB/s"
+
+
+def check_target(t, timeout=5):
+    """Reachability of a URL, host:port, or bare host/IP. Returns a dict."""
+    t = t.strip()
+    start = time.time()
+    ms = lambda: (time.time() - start) * 1000
+
+    if t.startswith(("http://", "https://")):
+        try:
+            req = urllib.request.Request(t, headers={"User-Agent": "pingpoint"},
+                                         method="HEAD")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return {"target": t, "kind": "http", "ok": resp.status < 500,
+                        "ms": ms(), "detail": f"HTTP {resp.status}"}
+        except urllib.error.HTTPError as e:
+            return {"target": t, "kind": "http", "ok": e.code < 500,
+                    "ms": ms(), "detail": f"HTTP {e.code}"}
+        except Exception:
+            return {"target": t, "kind": "http", "ok": False, "ms": None,
+                    "detail": "unreachable"}
+
+    # host:port ?
+    host, port = None, None
+    if t.count(":") == 1:
+        h, p = t.rsplit(":", 1)
+        if p.isdigit():
+            host, port = h, int(p)
+    if host:
+        try:
+            socket.create_connection((host, port), timeout=timeout).close()
+            return {"target": t, "kind": "tcp", "ok": True, "ms": ms(),
+                    "detail": f"port {port} open"}
+        except Exception:
+            return {"target": t, "kind": "tcp", "ok": False, "ms": None,
+                    "detail": f"port {port} closed/unreachable"}
+
+    # bare host or IP: ping, then fall back to TCP 443/80 (ICMP may be blocked)
+    ok, lat = ping(t)
+    if ok:
+        return {"target": t, "kind": "ping", "ok": True,
+                "ms": lat, "detail": "ping ok"}
+    for p in (443, 80):
+        try:
+            socket.create_connection((t, p), timeout=timeout).close()
+            return {"target": t, "kind": "tcp", "ok": True, "ms": ms(),
+                    "detail": f"tcp/{p} ok (ICMP blocked)"}
+        except Exception:
+            continue
+    return {"target": t, "kind": "ping", "ok": False, "ms": None,
+            "detail": "unreachable"}
+
+
+def check_targets(targets, timeout=5):
+    if not targets:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        return list(ex.map(lambda t: check_target(t, timeout), targets))
+
+
+def diagnose(info, target=None, watch_targets=None):
     r = Report()
     r.info = info
     addrs = info["addresses"]
@@ -665,8 +803,27 @@ def diagnose(info, target=None):
                     f"it won't respond. The issue is on that host's side.",
                     [f"Check if {target} is down for everyone, not just you."])
 
+    # Watchlist: user-specified servers to confirm reachable.
+    target_results = check_targets(watch_targets)
+    unreachable = []
+    for tr in target_results:
+        lat = f"  {tr['ms']:.0f}ms" if tr.get("ms") else ""
+        r.add(f"Reach {tr['target']}", PASS if tr["ok"] else FAIL,
+              tr["detail"] + lat)
+        if not tr["ok"]:
+            unreachable.append(tr["target"])
+    r.info["watchlist_unreachable"] = unreachable
+
     if r.diagnosis is None:
-        if any(c[1] == WARN for c in r.checks):
+        if unreachable:
+            r.diagnose(
+                "Your network is healthy, but these servers are unreachable: "
+                + ", ".join(unreachable) + ". The problem is on their side (or "
+                "they're blocking you), not your connection.",
+                ["Check if each server is down for everyone, not just you.",
+                 "If it's your own service, check the host/firewall/DNS for it."])
+            r.category = "target_unreachable"
+        elif any(c[1] == WARN for c in r.checks):
             r.diagnose(
                 "Core connectivity is healthy, but some checks flagged "
                 "warnings (above) that could cause intermittent issues.",
@@ -718,6 +875,9 @@ def render_report(r, elapsed, color=True):
         if info.get("public_ip"):
             rows.append(("Public IP",
                          info["public_ip"] + dim("   (what the internet sees)")))
+        tr = info.get("traffic")
+        if tr:
+            rows.append(("Traffic", f"↓ {rate(tr[0])}   ↑ {rate(tr[1])}"))
         for k, v in rows:
             L.append(f"    {k:<11}{v}")
 
@@ -729,8 +889,11 @@ def render_report(r, elapsed, color=True):
                 line += dim(f"  -  {detail}")
             L.append(line)
 
-        is_healthy = r.diagnosis and "fully healthy" in r.diagnosis
-        L += ["", (green if is_healthy else yellow)("  DIAGNOSIS"),
+        # Big status art: PROBLEM if anything failed, else HEALTHY.
+        has_fail = any(st == FAIL for _, st, _ in r.checks)
+        is_healthy = not has_fail and r.diagnosis and "unreachable" not in r.diagnosis
+        L += ["", status_art(is_healthy), ""]
+        L += [(green if is_healthy else red)("  DIAGNOSIS"),
               "  " + r.diagnosis.replace("\n", "\n  ")]
         if r.fixes:
             L += ["", cyan("  SUGGESTED FIXES")]
@@ -912,6 +1075,80 @@ def run_fixes(r, assume_yes=False):
     sys.stderr.write("\nRe-run pingpoint to confirm the fix worked.\n")
 
 
+def _status_line(r):
+    """One-line summary of a run for the watch console."""
+    detail = {n: d for n, s, d in r.checks}
+    net = detail.get("Internet by IP", "")
+    lat = ""
+    m = re.search(r"(\d+)ms", net)
+    if m:
+        lat = f"  net {m.group(1)}ms"
+    head = (r.diagnosis or "").split(".")[0]
+    return head + lat
+
+
+def watch_loop(interval, log_path, targets=None):
+    """Run repeatedly; log the full report whenever a problem is detected."""
+    extra = f" · watching {len(targets)} server(s)" if targets else ""
+    sys.stderr.write(banner() + "\n")
+    sys.stderr.write(
+        f"pingpoint watch — every {interval}s{extra}. "
+        f"Problems logged to:\n  {log_path}\nPress Ctrl-C to stop.\n\n")
+    sys.stderr.flush()
+    problems = 0
+    cycles = 0
+    was_healthy = True
+    prev_bytes, prev_t = _iface_bytes(), time.time()
+    try:
+        while True:
+            cycles += 1
+            t0 = time.time()
+            info = gather_info(want_public=False)
+            # throughput from the delta since last cycle (no extra sleep)
+            cur = _iface_bytes()
+            if prev_bytes and cur:
+                dt = max(0.001, t0 - prev_t)
+                info["traffic"] = ((cur[0] - prev_bytes[0]) / dt,
+                                   (cur[1] - prev_bytes[1]) / dt)
+            prev_bytes, prev_t = cur, t0
+            r = diagnose(info, watch_targets=targets)
+            healthy = r.diagnosis and "fully healthy" in r.diagnosis
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            traf = info.get("traffic")
+            traf_s = (dim(f"  ↓{rate(traf[0])} ↑{rate(traf[1])}") if traf else "")
+
+            if healthy:
+                line = green(f"[{ts}] OK") + dim(f"  {_status_line(r)}") + traf_s
+                if not was_healthy:
+                    line += cyan("   <- recovered")
+                    try:
+                        with open(log_path, "a", encoding="utf-8") as f:
+                            f.write(f"\n[{ts}] RECOVERED — network healthy again.\n")
+                    except OSError:
+                        pass
+            else:
+                problems += 1
+                line = red(f"[{ts}] PROBLEM") + f"  {_status_line(r)}" + traf_s
+                try:
+                    with open(log_path, "a", encoding="utf-8") as f:
+                        f.write("=" * 70 + f"\n[{ts}] problem #{problems} "
+                                f"(category: {r.category})\n" + "=" * 70 + "\n")
+                        f.write(render_report(r, time.time() - t0, color=False))
+                        f.write("\n")
+                except OSError as e:
+                    line += red(f"  (log write failed: {e})")
+            was_healthy = healthy
+            print(line)
+            sys.stdout.flush()
+            time.sleep(max(0, interval - (time.time() - t0)))
+    except KeyboardInterrupt:
+        sys.stderr.write(
+            f"\n\nstopped after {cycles} checks, {problems} with problems.\n")
+        if problems:
+            sys.stderr.write(f"full details logged to: {log_path}\n")
+        sys.exit(1 if problems else 0)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Smart cross-platform network diagnostics.")
     ap.add_argument("--json", action="store_true")
@@ -923,13 +1160,47 @@ def main():
     ap.add_argument("--no-prompt", action="store_true", help="never prompt (for scripts)")
     ap.add_argument("--fix", action="store_true", help="offer to run the matching remedy")
     ap.add_argument("--yes", action="store_true", help="auto-confirm --fix steps")
+    ap.add_argument("--watch", action="store_true",
+                    help="run continuously, logging only when a problem is found")
+    ap.add_argument("--interval", type=int, default=10,
+                    help="seconds between checks in --watch mode (default 10)")
+    ap.add_argument("--log", help="log file path for --watch (default: Downloads)")
+    ap.add_argument("--check", action="append", default=[], metavar="URL|HOST",
+                    help="server to confirm reachable (repeatable)")
+    ap.add_argument("--targets", help="comma-separated servers to confirm reachable")
+    ap.add_argument("--traffic", action="store_true",
+                    help="sample current up/down throughput")
     args = ap.parse_args()
     if args.no_color:
         C.disable()
 
+    targets = list(args.check)
+    if args.targets:
+        targets += [t for t in args.targets.split(",") if t.strip()]
+
+    # Show the logo immediately so the user knows it's working while it loads.
+    if not args.json:
+        print(banner())
+        sys.stdout.flush()
+
+    if args.watch:
+        log_path = args.log
+        if not log_path:
+            base = os.path.join(os.path.expanduser("~"), "Downloads")
+            if not os.path.isdir(base):
+                base = os.path.expanduser("~")
+            log_path = os.path.join(base, time.strftime("pingpoint_watch_%Y%m%d.log"))
+        watch_loop(args.interval, log_path, targets)
+        return
+
     start = time.time()
+    if not args.json:
+        sys.stdout.write(dim("  running diagnostics...\n"))
+        sys.stdout.flush()
     info = gather_info(want_public=not args.no_public)
-    r = diagnose(info, target=args.target)
+    if args.traffic:
+        info["traffic"] = throughput(1.0)
+    r = diagnose(info, target=args.target, watch_targets=targets)
     elapsed = time.time() - start
 
     if args.json:
