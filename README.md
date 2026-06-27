@@ -44,9 +44,9 @@ That single distinction answers most "the internet is down" complaints.
 | HTTP | Firewall / proxy blocking, broken TLS |
 | Path | MTU / fragmentation issues |
 
-## Install
+## Install & run
 
-No install. Grab `pingpoint.py` and run it.
+`pingpoint` is a single self-contained Python script — no installation, no dependencies.
 
 ```bash
 git clone https://github.com/utilman-exe/pingpoint.git
@@ -54,9 +54,13 @@ cd pingpoint
 python3 pingpoint.py
 ```
 
-On a fresh machine you can also just download `pingpoint.py` on its own — it has no dependencies.
+Or just download `pingpoint.py` on its own and run it:
 
-> **Note:** Linux and macOS ship Python 3. Windows usually does **not** — install it from [python.org](https://www.python.org/downloads/) and tick *"Add Python to PATH"*. The included `run_pingpoint.bat` launcher will tell you if Python is missing.
+```bash
+python3 pingpoint.py
+```
+
+> **Requirement:** Python 3. Linux and macOS ship it already. On Windows, install it from [python.org](https://www.python.org/downloads/) and tick *"Add Python to PATH"* during setup, then run `python pingpoint.py`.
 
 ## Usage
 
@@ -68,16 +72,6 @@ python3 pingpoint.py --target SITE    # also test reaching a specific host
 python3 pingpoint.py --json           # machine-readable output
 python3 pingpoint.py --no-public      # skip the public-IP lookup
 ```
-
-Non-technical users can double-click a launcher instead of using the terminal:
-
-| OS | Launcher |
-|----|----------|
-| Windows | `run_pingpoint.bat` |
-| macOS | `run_pingpoint.command` (first time: right-click → Open) |
-| Linux | `run_pingpoint.sh` |
-
-Keep the launcher in the same folder as `pingpoint.py`.
 
 ## Sample output
 
@@ -143,11 +137,10 @@ Pure standard library throughout. DNS resolution and HTTP checks run in Python i
 
 - The live code path is tested on **Linux**. The macOS and Windows command parsers are written and logic-tested but not yet run on those platforms — output mismatches are possible, and PRs/issues with sample output are very welcome.
 - IPv4 only for now (IPv6 checks are planned).
-- The standalone executable route (PyInstaller) isn't included — `pingpoint` is a single `.py` by design. Run it with Python.
 
 ## Contributing
 
-Issues and pull requests are welcome — especially real-world `--json` output from macOS and Windows to harden the parsers. Keep it dependency-free (standard library only).
+Issues and pull requests are welcome — especially real-world output from macOS and Windows to harden the parsers. Keep it dependency-free (standard library only).
 
 ## License
 
