@@ -2,12 +2,22 @@
 
 **Smart, cross-platform network diagnostics in pure Python.**
 
-When someone says *"I don't have internet,"* `pingpoint` tells you **why** — not just *that* something's broken, but *which layer* failed and how to fix it. It runs connectivity checks from the bottom up, stops at the first thing that's actually wrong, and explains it in plain language instead of dumping raw output.
+When someone says *"I don't have internet,"* `pingpoint` tells you **why** — not just *that* something's broken, but *which layer* failed and how to fix it. It runs connectivity checks from the bottom up, stops at the first thing that's actually wrong, and explains it in plain language instead of dumping raw output. It can also **monitor continuously**, log only when something breaks, watch **specific servers**, and show **live throughput**.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 ![Python 3](https://img.shields.io/badge/python-3.6%2B-blue.svg)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)
 ![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
+
+```
+           _                         _       __
+    ____  (_)___  ____ _____  ____  (_)___  / /_
+   / __ \/ / __ \/ __ `/ __ \/ __ \/ / __ \/ __/
+  / /_/ / / / / / /_/ / /_/ / /_/ / / / / / /_
+ / .___/_/_/ /_/\__, / .___/\____/_/_/ /_/\__/
+/_/            /____/_/
+                         made by utilman
+```
 
 ---
 
@@ -23,11 +33,15 @@ That single distinction answers most "the internet is down" complaints.
 ## Features
 
 - **Layered, fail-fast diagnosis** — checks each layer in order and stops at the first real failure, so you get one clear answer instead of a wall of red.
+- **Big, obvious verdict** — bold `HEALTHY` / `PROBLEM` ASCII art so you can read the result at a glance.
 - **Plain-language diagnosis + fix** for every failure mode.
-- **System summary** — interface, MAC, IPv4 + subnet, gateway, DNS servers, Wi-Fi SSID & signal strength, and public IP.
+- **System summary** — interface, MAC, IPv4 + subnet, gateway, DNS servers, Wi-Fi SSID & signal strength, public IP, and live throughput.
+- **Continuous monitoring** (`--watch`) — re-checks on an interval and logs the full report **only when something breaks**, perfect for catching intermittent drops.
+- **Server watchlist** (`--check`) — confirm specific URLs/IPs are reachable; distinguishes "that server is down" from "your network is down."
+- **Live throughput** (`--traffic`) — current up/down rate from the interface counters.
 - **Catches the common "no internet" causes** other tools miss: captive portals, `169.254` self-assigned (APIPA) addresses, airplane mode / disabled adapters.
 - **Auto-fix mode** (`--fix`) — offers to run the matching remedy (DHCP renew, DNS flush, re-enable adapter…) with per-step confirmation.
-- **Copy / save** — after each run, optionally copy the report to your clipboard or save it as a `.txt` in Downloads.
+- **Copy / save** — after a run, optionally copy the report to your clipboard or save it as a `.txt` in Downloads.
 - **`--json`** for scripting and monitoring; exit code `0` = healthy, `1` = problem found.
 - **Zero dependencies.** One standard-library Python file. Nothing to `pip install`.
 
@@ -43,6 +57,7 @@ That single distinction answers most "the internet is down" complaints.
 | DNS | Resolver down or misconfigured |
 | HTTP | Firewall / proxy blocking, broken TLS |
 | Path | MTU / fragmentation issues |
+| Watchlist | A specific URL/IP/server being unreachable |
 
 ## Install & run
 
@@ -65,57 +80,90 @@ python3 pingpoint.py
 ## Usage
 
 ```bash
-python3 pingpoint.py                  # run the diagnosis
-python3 pingpoint.py --fix            # offer to run the matching fix
-python3 pingpoint.py --fix --yes      # run fixes without confirming (careful)
-python3 pingpoint.py --target SITE    # also test reaching a specific host
-python3 pingpoint.py --json           # machine-readable output
-python3 pingpoint.py --no-public      # skip the public-IP lookup
+python3 pingpoint.py                       # run the diagnosis
+python3 pingpoint.py --fix                 # offer to run the matching fix
+python3 pingpoint.py --target SITE         # also test reaching one host
+python3 pingpoint.py --traffic             # include up/down throughput
+python3 pingpoint.py --json                # machine-readable output
+python3 pingpoint.py --no-public           # skip the public-IP lookup
+```
+
+### Monitoring an intermittent issue
+
+`--watch` re-checks on an interval (default 10s) and logs the **full report only when a problem is found**, so you end up with a clean timestamped record of when it dropped:
+
+```bash
+python3 pingpoint.py --watch                       # every 10s, log to Downloads
+python3 pingpoint.py --watch --interval 5          # every 5s
+python3 pingpoint.py --watch --log ~/net.log       # custom log path
+```
+
+The console shows a compact line each cycle; the log (`pingpoint_watch_YYYYMMDD.log`) gets the full report for problem cycles, plus a note when it recovers:
+
+```
+[2026-06-27 14:05:12] OK        net 11ms   down 1.2 MB/s up 84 KB/s
+[2026-06-27 14:05:22] PROBLEM   DNS is failing — internet works but names don't resolve
+[2026-06-27 14:05:32] OK        net 12ms   down 1.4 MB/s up 90 KB/s   <- recovered
+```
+
+The logged **category** of each failure (`dns`, `no_gateway`, `isp`, `captive`…) tells you whether it's the same cause each time or something flapping upstream, and the timestamps reveal the frequency and duration.
+
+### Watching specific servers
+
+Confirm one or more servers are reachable — URLs are checked over HTTP, `host:port` via a TCP connect, bare hosts/IPs via ping (falling back to TCP if ICMP is blocked):
+
+```bash
+python3 pingpoint.py --check https://api.myapp.com --check 10.0.0.5:5432
+python3 pingpoint.py --targets "github.com,1.1.1.1,db.internal:5432"
+```
+
+If your network is healthy but a watched server is down, pingpoint says so explicitly — *"these servers are unreachable… the problem is on their side, not your connection."* Combine with `--watch` to log exactly when a server drops:
+
+```bash
+python3 pingpoint.py --watch --check https://api.myapp.com --check 8.8.8.8
 ```
 
 ## Sample output
 
-Healthy network:
+A healthy network ends with the big green verdict:
 
 ```text
   SYSTEM
     Host       thinkpad
-    OS         Linux 6.8
     Interface  wlan0
-    MAC        a4:c3:f0:11:22:33
     IPv4       192.168.1.50/24
-    Subnet     192.168.1.0/24
     Gateway    192.168.1.1
     DNS        1.1.1.1, 8.8.8.8
     Wi-Fi SSID HomeNet_5G
     Signal     -47 dBm / 78%   (Excellent)
-    Public IP  203.0.113.7   (what the internet sees)
+    Traffic    down 1.2 MB/s   up 84.0 KB/s
 
   CHECKS  (8 run, 1.2s)
-  ----------------------------------------------------
-  [ OK ]  Local IP address  -  192.168.1.50/24
-  [ OK ]  Default gateway  -  192.168.1.1
-  [ OK ]  Reach gateway  -  192.168.1.1  2ms
-  [ OK ]  Internet by IP  -  1.1.1.1  11ms
-  [ OK ]  Captive portal  -  none
-  [ OK ]  DNS resolution  -  names resolving
-  [ OK ]  Load site by name  -  sites loading
-  [ OK ]  Path MTU (1500)  -  1500-byte packets pass
+  [ OK ]  Local IP address ... Default gateway ... Internet by IP ...
+  [ OK ]  Captive portal ... DNS resolution ... Load site by name ... Path MTU
+
+██╗  ██╗███████╗ █████╗ ██╗  ████████╗██╗  ██╗██╗   ██╗
+██║  ██║██╔════╝██╔══██╗██║  ╚══██╔══╝██║  ██║╚██╗ ██╔╝
+███████║█████╗  ███████║██║     ██║   ███████║ ╚████╔╝
+██╔══██║██╔══╝  ██╔══██║██║     ██║   ██╔══██║  ╚██╔╝
+██║  ██║███████╗██║  ██║███████╗██║   ██║  ██║   ██║
+╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚══════╝╚═╝   ╚═╝  ╚═╝   ╚═╝
 
   DIAGNOSIS
   Network is fully healthy. No issues found.
 ```
 
-Behind an airport captive portal:
+When something fails, you get the red `PROBLEM` art, the diagnosis, and the fix:
 
 ```text
-  CHECKS  (5 run, 2.4s)
-  ----------------------------------------------------
-  [ OK ]  Local IP address  -  10.5.12.88/16
-  [ OK ]  Default gateway  -  10.5.0.1
-  [ OK ]  Reach gateway  -  10.5.0.1  3ms
-  [ OK ]  Internet by IP  -  1.1.1.1  39ms
   [FAIL]  Captive portal  -  login page intercepting traffic
+
+██████╗ ██████╗  ██████╗ ██████╗ ██╗     ███████╗███╗   ███╗
+██╔══██╗██╔══██╗██╔═══██╗██╔══██╗██║     ██╔════╝████╗ ████║
+██████╔╝██████╔╝██║   ██║██████╔╝██║     █████╗  ██╔████╔██║
+██╔═══╝ ██╔══██╗██║   ██║██╔══██╗██║     ██╔══╝  ██║╚██╔╝██║
+██║     ██║  ██║╚██████╔╝██████╔╝███████╗███████╗██║ ╚═╝ ██║
+╚═╝     ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚══════╝╚═╝     ╚═╝
 
   DIAGNOSIS
   You're behind a captive portal — the 'sign in to Wi-Fi' page you get on
@@ -129,7 +177,7 @@ Behind an airport captive portal:
 
 ## How it works
 
-Pure standard library throughout. DNS resolution and HTTP checks run in Python itself (`socket`, `urllib`), so they're identical on every OS — only ping, route discovery, and Wi-Fi/MAC lookup need platform-specific commands (`ip`/`ifconfig`/`ipconfig`, `iw`/`nmcli`/`airport`/`netsh`). Every external command has a timeout, so it never hangs.
+Pure standard library throughout. DNS resolution and HTTP checks run in Python itself (`socket`, `urllib`), so they're identical on every OS — only ping, route discovery, throughput, and Wi-Fi/MAC lookup need platform-specific commands (`ip`/`ifconfig`/`ipconfig`, `iw`/`nmcli`/`airport`/`netsh`, `/proc/net/dev`/`netstat`). Every external command has a timeout, so it never hangs.
 
 `--fix` maps each diagnosis to a known remedy and runs it only after you confirm, auto-prefixing `sudo` when needed (or telling Windows users to run as Administrator). Failure modes with no safe automatic fix — captive portals, ISP outages — say so rather than guessing.
 
@@ -137,6 +185,7 @@ Pure standard library throughout. DNS resolution and HTTP checks run in Python i
 
 - The live code path is tested on **Linux**. The macOS and Windows command parsers are written and logic-tested but not yet run on those platforms — output mismatches are possible, and PRs/issues with sample output are very welcome.
 - IPv4 only for now (IPv6 checks are planned).
+- The `HEALTHY` / `PROBLEM` art uses block characters; it renders on modern terminals (incl. mobile Termux, iTerm, Windows Terminal). Use `--no-color` on a terminal that can't display them.
 
 ## Contributing
 
