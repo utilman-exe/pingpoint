@@ -487,6 +487,7 @@ def gather_info(want_public=True):
         except ValueError:
             pass
     iface = primary.get("iface") or dev
+    gw_mac = gateway_mac(gw)
     return {
         "host": socket.gethostname(),
         "os": f"{OS} {platform.release()}",
@@ -495,6 +496,8 @@ def gather_info(want_public=True):
         "addresses": addrs,
         "subnet": subnet,
         "gateway": gw,
+        "gateway_mac": gw_mac,
+        "router_vendor": router_vendor(gw_mac),
         "dns": dns_servers(),
         "wifi": wifi_info(iface),
         "public_ip": None,  # filled later only if connectivity is confirmed
@@ -618,7 +621,294 @@ def check_targets(targets, timeout=5):
         return list(ex.map(lambda t: check_target(t, timeout), targets))
 
 
-def diagnose(info, target=None, watch_targets=None):
+def ping_stats(host, count=10, interval=0.2, timeout=2):
+    """Multi-packet ping → {loss, min, avg, max, jitter} (ms), or None."""
+    if OS == "Windows":
+        cmd = ["ping", "-n", str(count), "-w", str(int(timeout * 1000)), host]
+    elif OS == "Linux":
+        cmd = ["ping", "-c", str(count), "-i", str(interval), "-W", str(timeout), host]
+    else:  # Darwin
+        cmd = ["ping", "-c", str(count), "-i", str(interval), host]
+    rc, out, _ = run(cmd, timeout=count * (interval + timeout) + 10)
+    st = {"loss": None, "min": None, "avg": None, "max": None, "jitter": None}
+    m = re.search(r"([\d.]+)%\s*packet loss", out) or re.search(r"\((\d+)% loss\)", out)
+    if m:
+        st["loss"] = float(m.group(1))
+    m = re.search(r"=\s*([\d.]+)/([\d.]+)/([\d.]+)(?:/([\d.]+))?\s*ms", out)
+    if m:
+        st["min"], st["avg"], st["max"] = (float(m.group(i)) for i in (1, 2, 3))
+        if m.group(4):
+            st["jitter"] = float(m.group(4))
+    else:
+        mm = re.search(r"Minimum = (\d+)ms.*?Maximum = (\d+)ms.*?Average = (\d+)ms",
+                       out, re.S)
+        if mm:
+            st["min"], st["max"], st["avg"] = (float(mm.group(i)) for i in (1, 2, 3))
+    return st if (st["loss"] is not None or st["avg"] is not None) else None
+
+
+def quality_verdict(st):
+    """(status, note) from ping stats."""
+    loss = st.get("loss") or 0
+    jit = st.get("jitter")
+    avg = st.get("avg")
+    bits = []
+    if avg is not None:
+        bits.append(f"{avg:.0f}ms")
+    if loss:
+        bits.append(f"{loss:.0f}% loss")
+    if jit is not None:
+        bits.append(f"{jit:.0f}ms jitter")
+    note = "  ".join(bits) or "ok"
+    if loss >= 20:
+        return FAIL, note + " — severe packet loss"
+    if loss >= 5:
+        return WARN, note + " — packet loss"
+    if jit is not None and jit >= 50:
+        return WARN, note + " — high jitter (calls/video will stutter)"
+    if jit is not None and jit >= 30:
+        return WARN, note + " — elevated jitter"
+    return PASS, note
+
+
+def check_ipv6():
+    """{addr, reachable, aaaa} — IPv6 posture."""
+    res = {"addr": None, "reachable": None, "aaaa": None}
+    try:
+        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        s.connect(("2606:4700:4700::1111", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and not ip.startswith(("fe80", "::1")):
+            res["addr"] = ip
+    except OSError:
+        pass
+    if res["addr"]:
+        if OS == "Windows":
+            cmd = ["ping", "-n", "2", "-6", "-w", "2000", "2606:4700:4700::1111"]
+        elif OS == "Linux":
+            cmd = ["ping", "-6", "-c", "2", "-W", "2", "2606:4700:4700::1111"]
+        else:
+            cmd = ["ping6", "-c", "2", "2606:4700:4700::1111"]
+        rc, _, _ = run(cmd, timeout=8)
+        res["reachable"] = rc == 0
+    try:
+        socket.getaddrinfo("cloudflare.com", 80, socket.AF_INET6)
+        res["aaaa"] = True
+    except Exception:
+        res["aaaa"] = False
+    return res
+
+
+def dns_speed(hosts=("cloudflare.com", "google.com", "wikipedia.org")):
+    """Average resolution time in ms, or None."""
+    times = []
+    for h in hosts:
+        t = time.time()
+        try:
+            socket.getaddrinfo(h, 80)
+            times.append((time.time() - t) * 1000)
+        except Exception:
+            pass
+    return sum(times) / len(times) if times else None
+
+
+def clock_skew():
+    """Compare system clock to an HTTP Date header (over http, so a bad clock
+    can't break it). Returns skew in seconds (local - server), or None."""
+    import email.utils
+    for url in ("http://cloudflare.com", "http://www.google.com"):
+        try:
+            req = urllib.request.Request(url, method="HEAD",
+                                         headers={"User-Agent": "pingpoint"})
+            with urllib.request.urlopen(req, timeout=5) as r:
+                d = r.headers.get("Date")
+                if d:
+                    server = email.utils.parsedate_to_datetime(d).timestamp()
+                    return time.time() - server
+        except Exception:
+            continue
+    return None
+
+
+def traceroute(target="1.1.1.1", max_hops=15):
+    """Run the OS traceroute. Returns list of {hop, ip, ms, timeout}."""
+    if OS == "Windows":
+        cmd = ["tracert", "-d", "-h", str(max_hops), "-w", "1000", target]
+    else:
+        cmd = ["traceroute", "-n", "-w", "1", "-q", "1", "-m", str(max_hops), target]
+    rc, out, _ = run(cmd, timeout=max_hops * 2 + 12)
+    hops = []
+    for line in out.splitlines():
+        m = re.match(r"\s*(\d+)\s+(.*)", line)
+        if not m:
+            continue
+        rest = m.group(2)
+        ipm = re.search(r"(\d+\.\d+\.\d+\.\d+)", rest)
+        latm = re.search(r"([\d.]+)\s*ms", rest)
+        hops.append({"hop": int(m.group(1)), "ip": ipm.group(1) if ipm else None,
+                     "ms": float(latm.group(1)) if latm else None,
+                     "timeout": ipm is None})
+    return hops
+
+
+ROUTER_OUI = {
+    # Curated common router / modem / AP vendor OUIs (first 3 octets).
+    "00095B": "Netgear", "001E2A": "Netgear", "001F33": "Netgear",
+    "00223F": "Netgear", "0024B2": "Netgear", "0026F2": "Netgear",
+    "08BD43": "Netgear", "204E7F": "Netgear", "28C68E": "Netgear",
+    "44947F": "Netgear", "9C3DCF": "Netgear", "C03F0E": "Netgear",
+    "E0469A": "Netgear", "E091F5": "Netgear",
+    "14CC20": "TP-Link", "50C7BF": "TP-Link", "60E327": "TP-Link",
+    "A42BB0": "TP-Link", "AC84C6": "TP-Link", "EC086B": "TP-Link",
+    "F4F26D": "TP-Link", "30B5C2": "TP-Link", "98DAC4": "TP-Link",
+    "001BFC": "ASUS", "002215": "ASUS", "04D4C4": "ASUS", "08606E": "ASUS",
+    "1C872C": "ASUS", "2C56DC": "ASUS", "305A3A": "ASUS", "50465D": "ASUS",
+    "AC9E17": "ASUS", "B06EBF": "ASUS", "D850E6": "ASUS", "F832E4": "ASUS",
+    "000C41": "Linksys/Cisco", "001839": "Linksys", "001A70": "Linksys",
+    "0021299": "Linksys", "48F8B3": "Linksys", "C0C1C0": "Cisco",
+    "00055D": "D-Link", "001346": "D-Link", "001CF0": "D-Link",
+    "1C7EE5": "D-Link", "28107B": "D-Link", "84C9B2": "D-Link",
+    "B8A386": "D-Link", "C8BE19": "D-Link", "F07D68": "D-Link",
+    "00156D": "Ubiquiti", "002722": "Ubiquiti", "0418D6": "Ubiquiti",
+    "245A4C": "Ubiquiti", "44D9E7": "Ubiquiti", "788A20": "Ubiquiti",
+    "B4FBE4": "Ubiquiti", "DC9FDB": "Ubiquiti", "FCECDA": "Ubiquiti",
+    "0000CA": "Arris", "00159A": "Arris", "001DCD": "Arris", "14358B": "Arris",
+    "3C754A": "Arris", "44E137": "Arris", "84E058": "Arris", "BC644B": "Arris",
+    "00147F": "Technicolor", "1CC63C": "Technicolor", "289EFC": "Technicolor",
+    "44 32C8": "Technicolor", "5C353B": "Technicolor", "88F7C7": "Technicolor",
+    "001882": "Huawei", "001E10": "Huawei", "04C06F": "Huawei",
+    "286ED4": "Huawei", "5C7D5E": "Huawei", "84A8E4": "Huawei", "ACE215": "Huawei",
+    "0015EB": "ZTE", "0019C6": "ZTE", "4C09B4": "ZTE", "986CF5": "ZTE",
+    "D0608C": "ZTE", "F46DE2": "ZTE",
+    "001349": "Zyxel", "0023F8": "Zyxel", "5CE28C": "Zyxel", "B0B2DC": "Zyxel",
+    "000C42": "MikroTik", "18FD74": "MikroTik", "488F5A": "MikroTik",
+    "6C3B6B": "MikroTik", "CC2DE0": "MikroTik", "E48D8C": "MikroTik",
+    "000B86": "Aruba", "186472": "Aruba", "6CF37F": "Aruba", "ACA31E": "Aruba",
+    "000A95": "Apple", "001B63": "Apple", "28CFDA": "Apple", "3C0754": "Apple",
+    "60334B": "Apple", "A8BBCF": "Apple",
+    "001A11": "Google", "30FD38": "Google", "388B59": "Google",
+    "6CADF8": "Google", "F4F5D8": "Google", "F4F5E8": "Google",
+    "244B81": "eero", "84531C": "eero", "F0214A": "eero",
+    "000FB3": "Actiontec", "001F90": "Actiontec", "00247B": "Actiontec",
+    "A021B7": "Actiontec", "FC51A4": "Actiontec",
+    "001A2B": "Sagemcom", "1499E2": "Sagemcom", "44E9DD": "Sagemcom",
+    "98C691": "Sagemcom", "F88E85": "Sagemcom",
+}
+
+
+def gateway_mac(gw):
+    """MAC of the gateway from the ARP/neighbour table. Returns MAC or None."""
+    if not gw:
+        return None
+    out = ""
+    if OS == "Linux":
+        rc, out, _ = run(["ip", "neigh", "show", gw])
+        if "lladdr" not in out:
+            rc, out, _ = run(["arp", "-n", gw])
+    elif OS == "Darwin":
+        rc, out, _ = run(["arp", "-n", gw])
+    elif OS == "Windows":
+        rc, out, _ = run(["arp", "-a", gw])
+    m = re.search(r"([0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5})", out)
+    return m.group(1) if m else None
+
+
+def router_vendor(mac):
+    if not mac:
+        return None
+    oui = re.sub(r"[^0-9A-Fa-f]", "", mac)[:6].upper()
+    return ROUTER_OUI.get(oui)
+
+
+def _download_speed(seconds=5):
+    url = "https://speed.cloudflare.com/__down?bytes=100000000"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "pingpoint"})
+        start = time.time()
+        total = 0
+        with urllib.request.urlopen(req, timeout=15) as r:
+            while True:
+                chunk = r.read(65536)
+                if not chunk or time.time() - start >= seconds:
+                    total += len(chunk)
+                    break
+                total += len(chunk)
+        el = time.time() - start
+        return (total * 8 / el / 1e6) if el > 0 else None
+    except Exception:
+        return None
+
+
+def _upload_speed(seconds=4):
+    url = "https://speed.cloudflare.com/__up"
+    try:
+        data = b"0" * (8 * 1024 * 1024)
+        req = urllib.request.Request(url, data=data, method="POST",
+                                     headers={"Content-Type": "application/octet-stream",
+                                              "User-Agent": "pingpoint"})
+        start = time.time()
+        with urllib.request.urlopen(req, timeout=20) as r:
+            r.read()
+        el = time.time() - start
+        return (len(data) * 8 / el / 1e6) if el > 0 else None
+    except Exception:
+        return None
+
+
+def speed_test():
+    """Returns {down_mbps, up_mbps} via Cloudflare's speed endpoint."""
+    return {"down_mbps": _download_speed(), "up_mbps": _upload_speed()}
+
+
+def notify_webhook(url, title, text):
+    """POST a message to a webhook, formatted for the detected provider."""
+    if "hooks.slack.com" in url:
+        payload = {"text": f"*{title}*\n{text}"}
+    elif "discord.com/api/webhooks" in url or "discordapp.com" in url:
+        payload = {"content": f"**{title}**\n{text}"}
+    elif any(d in url for d in ("office.com", "logic.azure.com",
+                                "powerautomate", "teams.microsoft")):
+        # Microsoft Teams Workflows / Power Automate. MessageCard is the
+        # supported drop-in format and also carries plain title/text fields,
+        # so custom flows that read 'text' still work.
+        payload = {"@type": "MessageCard",
+                   "@context": "http://schema.org/extensions",
+                   "summary": title, "themeColor": "D7263D",
+                   "title": title, "text": text.replace("\n", "  \n")}
+    else:  # generic
+        payload = {"title": title, "text": text, "message": f"{title}\n{text}"}
+    try:
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", "User-Agent": "pingpoint"})
+        urllib.request.urlopen(req, timeout=10).read()
+        return True
+    except Exception:
+        return False
+
+
+def send_email(cfg, subject, body):
+    """Send an alert email via SMTP (defaults to Office 365)."""
+    import smtplib
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["From"] = cfg.get("user") or cfg["to"]
+    msg["To"] = cfg["to"]
+    msg["Subject"] = subject
+    msg.set_content(body)
+    try:
+        with smtplib.SMTP(cfg["host"], cfg["port"], timeout=20) as s:
+            s.starttls()
+            if cfg.get("user") and cfg.get("password"):
+                s.login(cfg["user"], cfg["password"])
+            s.send_message(msg)
+        return True
+    except Exception:
+        return False
+
+
+def diagnose(info, target=None, watch_targets=None, light=False):
     r = Report()
     r.info = info
     addrs = info["addresses"]
@@ -741,6 +1031,45 @@ def diagnose(info, target=None, watch_targets=None):
     if info.get("_want_public"):
         info["public_ip"] = public_ip()
 
+    # Deeper checks run in parallel (each is a few seconds on its own).
+    # Skipped in light mode (continuous polling) to keep cycles fast.
+    qual = v6 = dspeed = skew = None
+    if not light:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as ex:
+            f_qual = ex.submit(ping_stats, "1.1.1.1")
+            f_v6 = ex.submit(check_ipv6)
+            f_dns = ex.submit(dns_speed)
+            f_clock = ex.submit(clock_skew)
+            qual = f_qual.result()
+            v6 = f_v6.result()
+            dspeed = f_dns.result()
+            skew = f_clock.result()
+
+    if qual:
+        st, note = quality_verdict(qual)
+        r.add("Connection quality", st, note)
+        r.info["quality"] = qual
+
+    # IPv6: only a problem if you HAVE a v6 address but can't use it (apps that
+    # prefer v6 then hang). No v6 at all is fine — just informational.
+    if v6 and v6["addr"]:
+        if v6["reachable"]:
+            r.add("IPv6", PASS, f"{v6['addr']} — reachable")
+        else:
+            r.add("IPv6", WARN, "have an IPv6 address but can't reach the IPv6 "
+                                "internet — apps that prefer IPv6 may hang")
+        r.info["ipv6"] = v6
+    elif v6:
+        r.add("IPv6", INFO, "not configured (IPv4-only — fine)")
+        r.info["ipv6"] = v6
+
+    if skew is not None and abs(skew) > 120:
+        r.add("System clock", WARN,
+              f"off by {abs(skew)/60:.0f} min — wrong clock breaks HTTPS "
+              f"(cert errors, sites won't load)")
+    elif skew is not None:
+        r.add("System clock", PASS, f"accurate (±{abs(skew):.0f}s)")
+
     dns_fail = [h for h in PUBLIC_HOSTS if not dns_resolves(h)]
     if len(dns_fail) == len(PUBLIC_HOSTS):
         r.add("DNS resolution", FAIL, "no names resolve")
@@ -756,7 +1085,14 @@ def diagnose(info, target=None, watch_targets=None):
     elif dns_fail:
         r.add("DNS resolution", WARN, f"some names failed: {', '.join(dns_fail)}")
     else:
-        r.add("DNS resolution", PASS, "names resolving")
+        resolver = (info.get("dns") or ["?"])[0]
+        if dspeed is not None and dspeed > 200:
+            r.add("DNS resolution", WARN,
+                  f"resolving but slow ({dspeed:.0f}ms via {resolver}) — "
+                  f"try 1.1.1.1 for faster lookups")
+        else:
+            spd = f"  {dspeed:.0f}ms via {resolver}" if dspeed is not None else ""
+            r.add("DNS resolution", PASS, "names resolving" + spd)
 
     http_fail = [h for h in PUBLIC_HOSTS if not http_ok(h)]
     if len(http_fail) == len(PUBLIC_HOSTS):
@@ -841,7 +1177,17 @@ def render_report(r, elapsed, color=True):
     old = C.enabled
     C.enabled = color
     try:
-        L = ["", cyan("  SYSTEM")]
+        # One-line verdict at the very top.
+        has_fail = any(st == FAIL for _, st, _ in r.checks)
+        has_warn = any(st == WARN for _, st, _ in r.checks)
+        head = (r.diagnosis or "").split(".")[0]
+        if has_fail:
+            summary = red("  >> PROBLEM: ") + head
+        elif has_warn:
+            summary = yellow("  >> OK (with warnings): ") + head
+        else:
+            summary = green("  >> HEALTHY — no issues found")
+        L = ["", summary, "", cyan("  SYSTEM")]
         info = r.info
         rows = [
             ("Host", info["host"]),
@@ -853,8 +1199,12 @@ def render_report(r, elapsed, color=True):
                 for a in info["addresses"]) or dim("none")),
             ("Subnet", info["subnet"] or dim("unknown")),
             ("Gateway", info["gateway"] or dim("none")),
-            ("DNS", ", ".join(info["dns"]) or dim("unknown")),
         ]
+        if info.get("router_vendor") or info.get("gateway_mac"):
+            vend = info.get("router_vendor") or "unknown vendor"
+            mac = info.get("gateway_mac")
+            rows.append(("Router", f"{vend}" + (dim(f"  ({mac})") if mac else "")))
+        rows.append(("DNS", ", ".join(info["dns"]) or dim("unknown")))
         wifi = info.get("wifi")
         if wifi:
             rows.append(("Wi-Fi SSID", wifi["ssid"]))
@@ -878,6 +1228,11 @@ def render_report(r, elapsed, color=True):
         tr = info.get("traffic")
         if tr:
             rows.append(("Traffic", f"↓ {rate(tr[0])}   ↑ {rate(tr[1])}"))
+        sp = info.get("speed")
+        if sp:
+            d = f"{sp['down_mbps']:.0f} Mbps" if sp.get("down_mbps") else "?"
+            u = f"{sp['up_mbps']:.0f} Mbps" if sp.get("up_mbps") else "?"
+            rows.append(("Speed", f"↓ {d}   ↑ {u}"))
         for k, v in rows:
             L.append(f"    {k:<11}{v}")
 
@@ -1087,70 +1442,128 @@ def _status_line(r):
     return head + lat
 
 
-def watch_loop(interval, log_path, targets=None):
-    """Run repeatedly; log the full report whenever a problem is detected."""
+MAX_LOG_BYTES = 2 * 1024 * 1024  # rotate the watch log past ~2 MB
+
+
+def _rotate_log(path):
+    """Keep the log small: if it exceeds the cap, roll to <path>.1 (one backup)."""
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > MAX_LOG_BYTES:
+            os.replace(path, path + ".1")
+    except OSError:
+        pass
+
+
+def watch_loop(interval, log_path, targets=None, full=False, notify=None):
+    """Continuous mode: re-check on an interval, log problems compactly, and
+    print a summary of what happened when you press Ctrl-C."""
     extra = f" · watching {len(targets)} server(s)" if targets else ""
+    depth = " · full checks" if full else ""
     sys.stderr.write(banner() + "\n")
     sys.stderr.write(
-        f"pingpoint watch — every {interval}s{extra}. "
-        f"Problems logged to:\n  {log_path}\nPress Ctrl-C to stop.\n\n")
+        f"pingpoint continuous — every {interval}s{extra}{depth}. "
+        f"Problems logged to:\n  {log_path}\nPress Ctrl-C to stop and see a summary.\n\n")
     sys.stderr.flush()
-    problems = 0
-    cycles = 0
+
+    import collections
+    started = time.time()
+    cycles = problems = 0
+    cats = collections.Counter()
+    first_at = last_at = None
+    streak = longest = 0          # consecutive problem cycles
+    last_cat = None
     was_healthy = True
     prev_bytes, prev_t = _iface_bytes(), time.time()
+
+    def log(text):
+        _rotate_log(log_path)
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(text)
+        except OSError:
+            pass
+
+    def send_alert(subject, body):
+        if not notify:
+            return
+        host = socket.gethostname()
+        if notify.get("webhook"):
+            notify_webhook(notify["webhook"], f"pingpoint @ {host}: {subject}", body)
+        if notify.get("email"):
+            send_email(notify["email"], f"pingpoint @ {host}: {subject}", body)
+
     try:
         while True:
             cycles += 1
             t0 = time.time()
             info = gather_info(want_public=False)
-            # throughput from the delta since last cycle (no extra sleep)
             cur = _iface_bytes()
             if prev_bytes and cur:
                 dt = max(0.001, t0 - prev_t)
                 info["traffic"] = ((cur[0] - prev_bytes[0]) / dt,
                                    (cur[1] - prev_bytes[1]) / dt)
             prev_bytes, prev_t = cur, t0
-            r = diagnose(info, watch_targets=targets)
-            healthy = r.diagnosis and "fully healthy" in r.diagnosis
+            r = diagnose(info, watch_targets=targets, light=not full)
+            has_fail = any(st == FAIL for _, st, _ in r.checks)
             ts = time.strftime("%Y-%m-%d %H:%M:%S")
             traf = info.get("traffic")
             traf_s = (dim(f"  ↓{rate(traf[0])} ↑{rate(traf[1])}") if traf else "")
 
-            if healthy:
+            if not has_fail:
+                streak = 0
                 line = green(f"[{ts}] OK") + dim(f"  {_status_line(r)}") + traf_s
                 if not was_healthy:
                     line += cyan("   <- recovered")
-                    try:
-                        with open(log_path, "a", encoding="utf-8") as f:
-                            f.write(f"\n[{ts}] RECOVERED — network healthy again.\n")
-                    except OSError:
-                        pass
+                    log(f"[{ts}] RECOVERED — healthy again.\n")
+                    send_alert("recovered", f"Network healthy again at {ts}.")
+                last_cat = None
             else:
                 problems += 1
+                streak += 1
+                longest = max(longest, streak)
+                cats[r.category] += 1
+                first_at = first_at or ts
+                last_at = ts
                 line = red(f"[{ts}] PROBLEM") + f"  {_status_line(r)}" + traf_s
-                try:
-                    with open(log_path, "a", encoding="utf-8") as f:
-                        f.write("=" * 70 + f"\n[{ts}] problem #{problems} "
-                                f"(category: {r.category})\n" + "=" * 70 + "\n")
-                        f.write(render_report(r, time.time() - t0, color=False))
-                        f.write("\n")
-                except OSError as e:
-                    line += red(f"  (log write failed: {e})")
-            was_healthy = healthy
+                # Compact one-liner every problem cycle (keeps the log tiny)...
+                log(f"[{ts}] {r.category:<18} {_status_line(r)}\n")
+                # ...plus one full report the first time a NEW cause appears,
+                # and an alert on the onset of a new problem type.
+                if r.category != last_cat:
+                    log("-" * 64 + f"\n[{ts}] detail for '{r.category}':\n")
+                    log(render_report(r, time.time() - t0, color=False) + "\n")
+                    send_alert(f"PROBLEM ({r.category})",
+                               f"{ts}\n{_status_line(r)}\n\n"
+                               + "\n".join(f"- {f}" for f in r.fixes))
+                last_cat = r.category
+            was_healthy = not has_fail
             print(line)
             sys.stdout.flush()
             time.sleep(max(0, interval - (time.time() - t0)))
     except KeyboardInterrupt:
-        sys.stderr.write(
-            f"\n\nstopped after {cycles} checks, {problems} with problems.\n")
-        if problems:
-            sys.stderr.write(f"full details logged to: {log_path}\n")
+        dur = time.time() - started
+        h, rem = divmod(int(dur), 3600)
+        mnt, sec = divmod(rem, 60)
+        span = (f"{h}h {mnt}m" if h else f"{mnt}m {sec}s")
+        sys.stderr.write("\n\n" + cyan("  ── watch summary ──") + "\n")
+        sys.stderr.write(f"  ran {span} · {cycles} checks\n")
+        if not problems:
+            sys.stderr.write(green("  no issues detected — connection was stable.\n"))
+        else:
+            causes = ", ".join(f"{c}×{n}" for c, n in cats.most_common())
+            sys.stderr.write(red(f"  {problems} problem cycle(s) detected.\n"))
+            sys.stderr.write(f"  causes:        {causes}\n")
+            sys.stderr.write(f"  first / last:  {first_at}  →  {last_at}\n")
+            sys.stderr.write(f"  longest outage: ~{longest * interval}s "
+                             f"({longest} consecutive checks)\n")
+            sys.stderr.write(f"  full log:      {log_path}\n")
         sys.exit(1 if problems else 0)
 
 
 def main():
     ap = argparse.ArgumentParser(description="Smart cross-platform network diagnostics.")
+    ap.add_argument("host", nargs="?", metavar="URL|IP",
+                    help="optional URL/IP to monitor (works with --watch too)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--no-color", action="store_true")
     ap.add_argument("--no-public", action="store_true", help="skip public-IP lookup")
@@ -1162,6 +1575,8 @@ def main():
     ap.add_argument("--yes", action="store_true", help="auto-confirm --fix steps")
     ap.add_argument("--watch", action="store_true",
                     help="run continuously, logging only when a problem is found")
+    ap.add_argument("--full", action="store_true",
+                    help="run the deep checks (quality/IPv6/clock) every --watch cycle")
     ap.add_argument("--interval", type=int, default=10,
                     help="seconds between checks in --watch mode (default 10)")
     ap.add_argument("--log", help="log file path for --watch (default: Downloads)")
@@ -1170,13 +1585,32 @@ def main():
     ap.add_argument("--targets", help="comma-separated servers to confirm reachable")
     ap.add_argument("--traffic", action="store_true",
                     help="sample current up/down throughput")
+    ap.add_argument("--trace", nargs="?", const="1.1.1.1", metavar="HOST",
+                    help="path-trace destination (default 1.1.1.1; runs automatically)")
+    ap.add_argument("--no-trace", action="store_true",
+                    help="skip the automatic path trace (faster)")
+    ap.add_argument("--speedtest", action="store_true",
+                    help="measure download/upload speed (uses bandwidth)")
+    ap.add_argument("--webhook", help="POST an alert to this webhook on problem "
+                                      "(Teams/Slack/Discord/Power Automate)")
+    ap.add_argument("--email-to", help="email address to alert on problem")
+    ap.add_argument("--smtp-host", default="smtp.office365.com")
+    ap.add_argument("--smtp-port", type=int, default=587)
+    ap.add_argument("--smtp-user", default=os.environ.get("PINGPOINT_SMTP_USER"))
+    ap.add_argument("--smtp-pass", default=os.environ.get("PINGPOINT_SMTP_PASS"))
     args = ap.parse_args()
     if args.no_color:
         C.disable()
 
+    # Any URL/IP — positional, --target, --check, or --targets — is monitored,
+    # in single runs and continuously in --watch.
     targets = list(args.check)
     if args.targets:
         targets += [t for t in args.targets.split(",") if t.strip()]
+    if args.target:
+        targets.append(args.target)
+    if args.host:
+        targets.append(args.host)
 
     # Show the logo immediately so the user knows it's working while it loads.
     if not args.json:
@@ -1190,7 +1624,13 @@ def main():
             if not os.path.isdir(base):
                 base = os.path.expanduser("~")
             log_path = os.path.join(base, time.strftime("pingpoint_watch_%Y%m%d.log"))
-        watch_loop(args.interval, log_path, targets)
+        notify = None
+        if args.webhook or args.email_to:
+            notify = {"webhook": args.webhook, "email": (
+                {"to": args.email_to, "host": args.smtp_host, "port": args.smtp_port,
+                 "user": args.smtp_user, "password": args.smtp_pass}
+                if args.email_to else None)}
+        watch_loop(args.interval, log_path, targets, full=args.full, notify=notify)
         return
 
     start = time.time()
@@ -1200,7 +1640,12 @@ def main():
     info = gather_info(want_public=not args.no_public)
     if args.traffic:
         info["traffic"] = throughput(1.0)
-    r = diagnose(info, target=args.target, watch_targets=targets)
+    if args.speedtest:
+        if not args.json:
+            sys.stdout.write(dim("  running speed test...\n"))
+            sys.stdout.flush()
+        info["speed"] = speed_test()
+    r = diagnose(info, watch_targets=targets)
     elapsed = time.time() - start
 
     if args.json:
@@ -1218,6 +1663,30 @@ def main():
         content = render_report(r, elapsed, color=False)  # always plain for copy/save
 
     healthy = r.diagnosis and "fully healthy" in r.diagnosis
+
+    # Path tracing runs automatically (single runs only — too slow per watch
+    # cycle). --no-trace skips it; --trace HOST changes the destination.
+    if not args.no_trace and not args.json:
+        tgt = args.trace if isinstance(args.trace, str) else "1.1.1.1"
+        sys.stdout.write(dim(f"\n  tracing path to {tgt} ...\n"))
+        sys.stdout.flush()
+        hops = traceroute(tgt)
+        print(cyan(f"\n  PATH TO {tgt}"))
+        if not hops:
+            print(dim("    (traceroute unavailable or no response)"))
+        else:
+            last = None
+            for h in hops:
+                if h["timeout"]:
+                    print(f"    {h['hop']:>2}  " + dim("* * *  (no reply)"))
+                else:
+                    ms = f"{h['ms']:.0f}ms" if h["ms"] is not None else ""
+                    print(f"    {h['hop']:>2}  {h['ip']:<16} {dim(ms)}")
+                    last = h["hop"]
+            if last and last < len(hops):
+                print(yellow(f"    → path stops responding after hop {last} "
+                             f"(the break is around there)"))
+        print()
 
     # --fix: offer to run the matching remedy (only when there's a problem).
     if args.fix and not healthy:
